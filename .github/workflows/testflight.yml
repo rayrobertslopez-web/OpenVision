@@ -44,6 +44,16 @@ jobs:
           cp OpenVision/Config/Config.swift.example OpenVision/Config/Config.swift
           grep -c "=" Config.xcconfig
 
+      - name: Preconfigure the Claude bridge as the default backend
+        # Daniel's build talks to Ray's laptop bridge out of the box (OpenAI-compatible endpoint -> Claude).
+        run: |
+          F=OpenVision/Models/AppSettings.swift
+          sed -i '' 's|var aiBackend: AIBackendType = .openClaw|var aiBackend: AIBackendType = .openAI|' "$F"
+          sed -i '' 's|var openAIAPIKey: String = ""|var openAIAPIKey: String = "${{ secrets.OV_BRIDGE_KEY }}"|' "$F"
+          sed -i '' 's|var openAIModel: String = "gpt-4o-mini"|var openAIModel: String = "claude-opus-5-5"|' "$F"
+          sed -i '' 's|var openAIBaseURL: String = "https://api.openai.com/v1"|var openAIBaseURL: String = "${{ secrets.OV_BRIDGE_URL }}"|' "$F"
+          grep -n "aiBackend: AIBackendType =\|openAIModel: String =\|openAIBaseURL: String =" "$F"
+
       - name: Cache Swift packages
         uses: actions/cache@v4
         with:
