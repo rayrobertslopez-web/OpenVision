@@ -83,6 +83,16 @@ jobs:
           sed -i '' 's/CODE_SIGN_IDENTITY = "iPhone Developer";/CODE_SIGN_IDENTITY = "iPhone Distribution";/g' OpenVision.xcodeproj/project.pbxproj
           grep -c "CODE_SIGN_STYLE = Manual" OpenVision.xcodeproj/project.pbxproj
           grep -c "iPhone Distribution" OpenVision.xcodeproj/project.pbxproj
+          # App Store validation: "fetch"/"processing" background modes need BGTaskSchedulerPermittedIdentifiers,
+          # and the app registers no background tasks, so drop those two modes (audio + Bluetooth stay).
+          PL=OpenVision/Resources/Info.plist
+          for mode in fetch processing; do
+            for i in 0 1 2 3 4 5 6; do
+              v=$(/usr/libexec/PlistBuddy -c "Print :UIBackgroundModes:$i" "$PL" 2>/dev/null || true)
+              if [ "$v" = "$mode" ]; then /usr/libexec/PlistBuddy -c "Delete :UIBackgroundModes:$i" "$PL"; break; fi
+            done
+          done
+          /usr/libexec/PlistBuddy -c "Print :UIBackgroundModes" "$PL"
 
       - name: Archive
         run: |
