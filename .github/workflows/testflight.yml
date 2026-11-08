@@ -1,0 +1,132 @@
+name: TestFlight
+
+# Ray's fork (rayrobertslopez-web/OpenVision): build the app with the TaxiListo LLC Apple team and upload it to
+# TestFlight on a tag push. Public repo, so the macOS runner minutes are free. Secrets (repo settings):
+#   OV_TEAM_ID, OV_BUNDLE_ID, OV_META_APP_ID, OV_CLIENT_TOKEN, OV_APP_LINK_SCHEME
+#   IOS_DIST_CERT_BASE64, IOS_DIST_CERT_PASSWORD, IOS_PROVISIONING_PROFILE_BASE64
+#   APP_STORE_CONNECT_API_KEY_ID, APP_STORE_CONNECT_API_KEY_ISSUER_ID, APP_STORE_CONNECT_API_KEY_BASE64
+# Tags: ov-1.0.0 uploads; ov-1.0.0-test builds the IPA and stops.
+
+on:
+  push:
+    tags: ["ov-*"]
+  workflow_dispatch:
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+
+jobs:
+  build-and-upload:
+    runs-on: macos-26
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Metal toolchain (on-device MLX needs the metal compiler)
+        run: xcodebuild -downloadComponent MetalToolchain || true
+
+      - name: Write Config.xcconfig and Config.swift
+        run: |
+          cat > Config.xcconfig <<EOF
+          DEVELOPMENT_TEAM = ${{ secrets.OV_TEAM_ID }}
+          PRODUCT_BUNDLE_IDENTIFIER = ${{ secrets.OV_BUNDLE_ID }}
+          META_APP_ID = ${{ secrets.OV_META_APP_ID }}
+          CLIENT_TOKEN = ${{ secrets.OV_CLIENT_TOKEN }}
+          APP_LINK_URL_SCHEME = ${{ secrets.OV_APP_LINK_SCHEME }}
+          EOF
+          cp OpenVision/Config/Config.swift.example OpenVision/Config/Config.swift
+          grep -c "=" Config.xcconfig
+
+      - name: Cache Swift packages
+        uses: actions/cache@v4
+        with:
+          path: .spm
+          key: spm-${{ runner.os }}-${{ hashFiles('OpenVision.xcodeproj/project.pbxproj', 'project.yml') }}
+          restore-keys: spm-${{ runner.os }}-
+
+      - name: Import signing certificate
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.IOS_DIST_CERT_BASE64 }}
+          p12-password: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+          keychain: openvision-ci.keychain-db
+          keychain-password: ${{ secrets.IOS_DIST_CERT_PASSWORD }}
+
+      - name: Install provisioning profile
+        id: profile
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}" | base64 --decode > $RUNNER_TEMP/ov.mobileprovision
+          UUID=$(/usr/libexec/PlistBuddy -c 'Print UUID' /dev/stdin <<< "$(security cms -D -i $RUNNER_TEMP/ov.mobileprovision)")
+          NAME=$(/usr/libexec/PlistBuddy -c 'Print Name' /dev/stdin <<< "$(security cms -D -i $RUNNER_TEMP/ov.mobileprovision)")
+          cp $RUNNER_TEMP/ov.mobileprovision ~/Library/MobileDevice/Provisioning\ Profiles/$UUID.mobileprovision
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "profile: $NAME ($UUID)"
+
+      - name: Build number
+        id: bn
+        run: echo "value=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Archive
+        run: |
+          set -o pipefail
+          xcodebuild archive \
+            -project OpenVision.xcodeproj \
+            -scheme OpenVision \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath $RUNNER_TEMP/OpenVision.xcarchive \
+            -clonedSourcePackagesDirPath .spm \
+            -skipPackagePluginValidation \
+            -skipMacroValidation \
+            CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="${{ secrets.OV_TEAM_ID }}" \
+            PROVISIONING_PROFILE_SPECIFIER="${{ steps.profile.outputs.name }}" \
+            CODE_SIGN_IDENTITY="iPhone Distribution" \
+            CURRENT_PROJECT_VERSION="${{ steps.bn.outputs.value }}" \
+            OTHER_CODE_SIGN_FLAGS="--keychain openvision-ci.keychain-db" \
+          | xcbeautify --renderer github-actions
+
+      - name: Export IPA
+        run: |
+          cat > $RUNNER_TEMP/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>teamID</key><string>${{ secrets.OV_TEAM_ID }}</string>
+            <key>uploadSymbols</key><true/>
+            <key>destination</key><string>export</string>
+            <key>signingStyle</key><string>manual</string>
+            <key>provisioningProfiles</key><dict>
+              <key>${{ secrets.OV_BUNDLE_ID }}</key><string>${{ steps.profile.outputs.name }}</string>
+            </dict>
+          </dict></plist>
+          EOF
+          xcodebuild -exportArchive -archivePath $RUNNER_TEMP/OpenVision.xcarchive -exportPath $RUNNER_TEMP/out -exportOptionsPlist $RUNNER_TEMP/ExportOptions.plist
+          ls -la $RUNNER_TEMP/out
+
+      - name: Upload to TestFlight
+        if: ${{ !endsWith(github.ref, '-test') }}
+        run: |
+          mkdir -p ~/.appstoreconnect/private_keys
+          echo "${{ secrets.APP_STORE_CONNECT_API_KEY_BASE64 }}" | base64 --decode > ~/.appstoreconnect/private_keys/AuthKey_${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}.p8
+          IPA=$(ls $RUNNER_TEMP/out/*.ipa | head -1)
+          xcrun altool --upload-app --type ios --file "$IPA" --apiKey "${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}" --apiIssuer "${{ secrets.APP_STORE_CONNECT_API_KEY_ISSUER_ID }}"
+
+      - name: Keep the IPA as an artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenVision-ipa
+          path: ${{ runner.temp }}/out/*.ipa
+          if-no-files-found: ignore
+
+      - name: Cleanup keychain
+        if: always()
+        run: security delete-keychain openvision-ci.keychain-db || true
