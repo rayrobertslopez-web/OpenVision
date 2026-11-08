@@ -80,7 +80,9 @@ jobs:
           echo "PROVISIONING_PROFILE_SPECIFIER = ${{ steps.profile.outputs.name }}" >> Config.xcconfig
           tail -3 Config.xcconfig
           sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' OpenVision.xcodeproj/project.pbxproj
+          sed -i '' 's/CODE_SIGN_IDENTITY = "iPhone Developer";/CODE_SIGN_IDENTITY = "iPhone Distribution";/g' OpenVision.xcodeproj/project.pbxproj
           grep -c "CODE_SIGN_STYLE = Manual" OpenVision.xcodeproj/project.pbxproj
+          grep -c "iPhone Distribution" OpenVision.xcodeproj/project.pbxproj
 
       - name: Archive
         run: |
