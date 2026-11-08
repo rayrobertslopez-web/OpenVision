@@ -38,6 +38,9 @@ jobs:
           META_APP_ID = ${{ secrets.OV_META_APP_ID }}
           CLIENT_TOKEN = ${{ secrets.OV_CLIENT_TOKEN }}
           APP_LINK_URL_SCHEME = ${{ secrets.OV_APP_LINK_SCHEME }}
+          CODE_SIGN_STYLE = Manual
+          CODE_SIGN_IDENTITY = iPhone Distribution
+          PROVISIONING_PROFILE_SPECIFIER = $(OV_PROFILE_NAME)
           EOF
           cp OpenVision/Config/Config.swift.example OpenVision/Config/Config.swift
           grep -c "=" Config.xcconfig
@@ -68,9 +71,16 @@ jobs:
           echo "name=$NAME" >> "$GITHUB_OUTPUT"
           echo "profile: $NAME ($UUID)"
 
-      - name: Build number
+      - name: Build number + manual signing for the app target only
         id: bn
-        run: echo "value=$(date +%s)" >> "$GITHUB_OUTPUT"
+        # Signing settings must NOT go on the xcodebuild command line: they would be forced onto every Swift
+        # package (mlx-swift, FluidAudio, ...) which cannot take a provisioning profile. They live in the
+        # xcconfig instead, which only the app project reads; the project's "Automatic" default is flipped here.
+        run: |
+          echo "value=$(date +%s)" >> "$GITHUB_OUTPUT"
+          echo "OV_PROFILE_NAME = ${{ steps.profile.outputs.name }}" >> Config.xcconfig
+          sed -i '' 's/CODE_SIGN_STYLE = Automatic;/CODE_SIGN_STYLE = Manual;/g' OpenVision.xcodeproj/project.pbxproj
+          grep -c "CODE_SIGN_STYLE = Manual" OpenVision.xcodeproj/project.pbxproj
 
       - name: Archive
         run: |
@@ -84,10 +94,6 @@ jobs:
             -clonedSourcePackagesDirPath .spm \
             -skipPackagePluginValidation \
             -skipMacroValidation \
-            CODE_SIGN_STYLE=Manual \
-            DEVELOPMENT_TEAM="${{ secrets.OV_TEAM_ID }}" \
-            PROVISIONING_PROFILE_SPECIFIER="${{ steps.profile.outputs.name }}" \
-            CODE_SIGN_IDENTITY="iPhone Distribution" \
             CURRENT_PROJECT_VERSION="${{ steps.bn.outputs.value }}" \
             OTHER_CODE_SIGN_FLAGS="--keychain openvision-ci.keychain-db" \
           | xcbeautify --renderer github-actions
