@@ -142,6 +142,10 @@
         <true/>
     </dict>
 
+    <!-- Export compliance: the app only uses standard HTTPS, so TestFlight needs no per-build encryption answer -->
+    <key>ITSAppUsesNonExemptEncryption</key>
+    <false/>
+
     <!-- Wearables Device Access Toolkit configuration -->
     <key>MWDAT</key>
     <dict>
