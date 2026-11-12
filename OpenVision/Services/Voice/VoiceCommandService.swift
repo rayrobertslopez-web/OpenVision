@@ -482,7 +482,9 @@ final class VoiceCommandService: ObservableObject {
     /// Start conversation timeout (auto-exit after silence)
     private func startConversationTimeout() {
         conversationTimeoutTimer?.invalidate()
-        conversationTimeoutTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
+        // 20 s, not 4: with 4 the conversation closed before the wearer had drawn breath for a
+        // follow-up, and every next question needed the wake word (or a tap) again.
+        conversationTimeoutTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: false) { [weak self] _ in
             Task { @MainActor in
                 self?.handleConversationTimeout()
             }

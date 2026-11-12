@@ -40,7 +40,19 @@ final class GlassesManager: ObservableObject {
     @Published var lastPhotoData: Data?
 
     /// Error message for UI display
-    @Published var errorMessage: String?
+    @Published var errorMessage: String? {
+        didSet {
+            if let errorMessage {
+                lastError = errorMessage
+                lastErrorAt = Date()
+            }
+        }
+    }
+
+    /// The most recent error, kept after the alert that showed it is dismissed, so it can be
+    /// spoken or sent along with a question ("why can't you see?"). Cleared when a stream starts.
+    private(set) var lastError: String?
+    private(set) var lastErrorAt = Date.distantPast
 
     // MARK: - Private Properties
 
@@ -248,6 +260,7 @@ final class GlassesManager: ObservableObject {
             setupStreamListeners(stream: cam.stream)
             cam.stream.start()
             isStreaming = true
+            lastError = nil
             print("[GlassesManager] Streaming started successfully")
         } catch {
             errorMessage = "Stream start failed: \(error.localizedDescription)"

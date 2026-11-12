@@ -58,6 +58,11 @@ final class OpenAIService: ObservableObject {
             let glassesState = !glasses.isRegistered ? "unregistered"
                 : glasses.isStreaming ? "streaming"
                 : glasses.connectedDeviceCount > 0 ? "connected" : "no-device"
+            // A recent glasses error rides along too (ASCII only: it travels in a header).
+            var glassesError = ""
+            if let lastError = glasses.lastError, Date().timeIntervalSince(glasses.lastErrorAt) < 600 {
+                glassesError = String(lastError.filter { ($0.asciiValue ?? 0) >= 32 }.prefix(240))
+            }
             reply = try await CloudChat.chatCompletionsReply(
                 text: text, imageData: imageData, model: settings.openAIModel, label: "OpenAI"
             ) { body in
@@ -70,6 +75,9 @@ final class OpenAIService: ObservableObject {
                 if selfHosted {
                     request.setValue("120", forHTTPHeaderField: "X-OV-Timeout")
                     request.setValue(glassesState, forHTTPHeaderField: "X-OV-Glasses")
+                    if !glassesError.isEmpty {
+                        request.setValue(glassesError, forHTTPHeaderField: "X-OV-Glasses-Error")
+                    }
                 }
                 return try await CloudChat.dataWithRetry(for: request)
             }
