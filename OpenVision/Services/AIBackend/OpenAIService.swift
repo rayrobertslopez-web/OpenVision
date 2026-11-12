@@ -52,6 +52,12 @@ final class OpenAIService: ObservableObject {
             // A self-hosted bridge may look things up before answering (earlier frames, files on
             // the user's computer), so give it longer than the public API and tell it how long.
             let selfHosted = BridgeWatch.isCustomEndpoint(settings.openAIBaseURL)
+            // The bridge's model cannot see the app: tell it where the glasses link stands, so it
+            // can give the right next step instead of "start watching" when that cannot work.
+            let glasses = GlassesManager.shared
+            let glassesState = !glasses.isRegistered ? "unregistered"
+                : glasses.isStreaming ? "streaming"
+                : glasses.connectedDeviceCount > 0 ? "connected" : "no-device"
             reply = try await CloudChat.chatCompletionsReply(
                 text: text, imageData: imageData, model: settings.openAIModel, label: "OpenAI"
             ) { body in
@@ -61,7 +67,10 @@ final class OpenAIService: ObservableObject {
                 request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
                 request.httpBody = body
                 request.timeoutInterval = selfHosted ? 120 : 60
-                if selfHosted { request.setValue("120", forHTTPHeaderField: "X-OV-Timeout") }
+                if selfHosted {
+                    request.setValue("120", forHTTPHeaderField: "X-OV-Timeout")
+                    request.setValue(glassesState, forHTTPHeaderField: "X-OV-Glasses")
+                }
                 return try await CloudChat.dataWithRetry(for: request)
             }
         }
