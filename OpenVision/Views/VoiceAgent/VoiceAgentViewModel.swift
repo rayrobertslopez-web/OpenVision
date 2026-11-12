@@ -80,6 +80,10 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Frame counter for logging
     private var videoFrameCount: Int = 0
 
+    /// Live video mode is running against the user's own bridge (BridgeWatch): frames are uploaded
+    /// continuously, speech stays on Apple STT and questions go over chat completions.
+    private var bridgeWatchActive = false
+
     // MARK: - Agent State
 
     enum AgentState: Equatable {
@@ -203,6 +207,13 @@ final class VoiceAgentViewModel: ObservableObject {
             // In live video mode, a silence timeout must NOT end the mode — the user expects
             // to keep asking questions (camera stays on) until they say "stop video". Re-arm
             // conversation mode so the next question is heard without a fresh wake word.
+            if isLiveVideoMode && bridgeWatchActive && settingsManager.settings.wakeWordEnabled {
+                // Bridge watch mode runs for long stretches. Keep watching, but go back to waiting
+                // for the wake word: with the mic open all day, every nearby voice would otherwise
+                // become a question. Follow-ups right after a reply still need no wake word.
+                agentState = .liveVideo
+                return
+            }
             if isLiveVideoMode {
                 print("[VoiceAgent] Idle during live video — re-arming conversation mode")
                 voiceCommandService.enterConversationMode()
@@ -890,6 +901,7 @@ final class VoiceAgentViewModel: ObservableObject {
         let isStopCommand = (!commandWords.isDisjoint(with: stopSingleWords)
                              || stopPhrases.contains { lowerCommand.contains($0) })
                              && !lowerCommand.contains("video") && !lowerCommand.contains("stream")
+                             && !lowerCommand.contains("watching") && !lowerCommand.contains("watch mode")
 
         if isStopCommand {
             // In live video mode, "stop" means SHUT UP, not "tear down my camera session" —
@@ -913,18 +925,20 @@ final class VoiceAgentViewModel: ObservableObject {
 
         // Check for live video mode commands
         let startLiveKeywords = ["start video stream", "start live video", "start video", "start streaming",
-                                 "enable video", "live mode", "go live", "video mode"]
+                                 "enable video", "live mode", "go live", "video mode",
+                                 "start watching", "watch mode", "watch what i"]
 
         let isStartLiveCommand = startLiveKeywords.contains { lowerCommand.contains($0) }
         // Fuzzy stop match: any "video"/"stream" phrase with a stop-like word. Tolerates Apple STT
         // dropping the leading 's' ("stop video" → "top video"), which previously sailed past the
         // exact-keyword list and got sent to the model as a question instead of ending the mode.
         let mentionsVideo = lowerCommand.contains("video") || lowerCommand.contains("stream")
+            || lowerCommand.contains("watching") || lowerCommand.contains("watch mode")
         let stopWords = ["stop", "top ", "end ", "exit", "disable", "close", "quit", "turn off"]
         let isStopLiveCommand = mentionsVideo && stopWords.contains { lowerCommand.contains($0) }
 
         // Handle live video mode commands
-        if isStartLiveCommand {
+        if isStartLiveCommand && !isStopLiveCommand {
             print("[VoiceAgent] Starting live video mode...")
             await startLiveVideoMode()
             return
@@ -959,7 +973,11 @@ final class VoiceAgentViewModel: ObservableObject {
             if activeLiveService == nil {
                 // Local (SmolVLM2) live mode: STT is the input path, so every command lands here.
                 // Answer it against the latest glasses frame.
-                await handleLocalLiveVideoCommand(command)
+                if bridgeWatchActive {
+                    await handleBridgeLiveVideoCommand(command)
+                } else {
+                    await handleLocalLiveVideoCommand(command)
+                }
             } else if activeLiveService === geminiLive {
                 // Cloud modes stream audio directly, so this shouldn't be reached — but Gemini
                 // can accept a text turn as a fallback. OpenAI Realtime is audio-only here.
@@ -1052,6 +1070,13 @@ final class VoiceAgentViewModel: ObservableObject {
         // no WebSocket — Apple STT keeps listening and the reply is spoken via the selected TTS.
         if settingsManager.settings.aiBackend == .localGemma && GemmaLocalService.shared.visionReady {
             await startLocalLiveVideoMode()
+            return
+        }
+
+        // The OpenAI slot pointed at the user's own endpoint: there is no Realtime socket there.
+        // Upload frames to it and keep answering spoken questions over chat completions.
+        if BridgeWatch.isAvailable {
+            await startBridgeLiveVideoMode()
             return
         }
 
@@ -1159,6 +1184,68 @@ final class VoiceAgentViewModel: ObservableObject {
             return (openAIRealtime, "OpenAI Realtime")
         }
         return nil
+    }
+
+    /// Live video against the user's own bridge. Like the on-device mode, audio stays on the
+    /// normal Apple STT path and replies speak through the selected TTS engine; the difference is
+    /// that frames are uploaded continuously (BridgeWatch), so the model behind the bridge sees
+    /// the current view and remembers earlier ones.
+    private func startBridgeLiveVideoMode() async {
+        print("[VoiceAgent] Starting bridge watch mode...")
+
+        if !glassesManager.isStreaming {
+            await glassesManager.startStreaming()
+        }
+        guard glassesManager.isStreaming else {
+            ttsService.speak("I couldn't start the glasses camera")
+            return
+        }
+
+        // Same constraint as the on-device mode: the glasses' Bluetooth mic goes deaf while their
+        // camera streams, so the phone mic + speaker carry the whole session.
+        voiceCommandService.stopListening()
+        try? AudioSessionManager.shared.configureForPhone()
+        do {
+            try voiceCommandService.startListening()
+        } catch {
+            print("[VoiceAgent] Failed to restart STT on phone mic: \(error)")
+        }
+        voiceCommandService.enterConversationMode()
+
+        bridgeWatchActive = true
+        isLiveVideoMode = true
+        agentState = .liveVideo
+        // The camera stream pauses when the phone locks, so keep the screen awake while watching.
+        UIApplication.shared.isIdleTimerDisabled = true
+        BridgeWatch.shared.start()
+
+        print("[VoiceAgent] ✓ Bridge watch mode active - uploading frames, questions over chat completions")
+        if settingsManager.settings.wakeWordEnabled {
+            ttsService.speak("Watching. Say \(settingsManager.settings.wakeWord) when you need me.")
+        } else {
+            ttsService.speak("Watching. Ask me anything.")
+        }
+    }
+
+    /// Answer a spoken question in bridge watch mode. The bridge already holds the recent frames;
+    /// one fresh frame rides along so the answer is about the view at the moment of asking.
+    private func handleBridgeLiveVideoCommand(_ command: String) async {
+        agentState = .thinking
+        var jpeg: Data?
+        if let frame = await freshestGlassesFrame(settle: 0.2, maxWait: 0.8),
+           Date().timeIntervalSince(glassesManager.lastFrameTime) < 3 {
+            jpeg = frame.jpegData(compressionQuality: 0.6)
+        }
+        do {
+            try await OpenAIService.shared.sendMessage(command, imageData: jpeg)
+        } catch {
+            print("[VoiceAgent] Bridge watch question failed: \(error)")
+            errorMessage = "Failed to send command: \(error.localizedDescription)"
+            speakResponse("Sorry, I couldn't reach the laptop.")
+        }
+        if isLiveVideoMode, !ttsService.isSpeaking, !NeuralSpeech.isAnySpeaking {
+            agentState = .liveVideo
+        }
     }
 
     /// Fully on-device live video (SmolVLM2). Unlike the cloud modes, audio stays on the normal
@@ -1559,6 +1646,11 @@ final class VoiceAgentViewModel: ObservableObject {
             return
         }
         stopWatchLoop()
+        if bridgeWatchActive {
+            BridgeWatch.shared.stop()
+            bridgeWatchActive = false
+            UIApplication.shared.isIdleTimerDisabled = false
+        }
 
         print("[VoiceAgent] Stopping live video mode...")
 

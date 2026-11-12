@@ -49,6 +49,9 @@ final class OpenAIService: ObservableObject {
                 throw OpenAIError.badURL
             }
             let apiKey = settings.openAIAPIKey
+            // A self-hosted bridge may look things up before answering (earlier frames, files on
+            // the user's computer), so give it longer than the public API and tell it how long.
+            let selfHosted = BridgeWatch.isCustomEndpoint(settings.openAIBaseURL)
             reply = try await CloudChat.chatCompletionsReply(
                 text: text, imageData: imageData, model: settings.openAIModel, label: "OpenAI"
             ) { body in
@@ -57,7 +60,8 @@ final class OpenAIService: ObservableObject {
                 request.setValue("application/json", forHTTPHeaderField: "Content-Type")
                 request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
                 request.httpBody = body
-                request.timeoutInterval = 60
+                request.timeoutInterval = selfHosted ? 120 : 60
+                if selfHosted { request.setValue("120", forHTTPHeaderField: "X-OV-Timeout") }
                 return try await CloudChat.dataWithRetry(for: request)
             }
         }
@@ -122,5 +126,131 @@ final class OpenAIService: ObservableObject {
             case .badURL: return "The OpenAI base URL is invalid."
             }
         }
+    }
+}
+
+
+// MARK: - Bridge watch (live frames to a self-hosted OpenAI-compatible endpoint)
+
+/// While live video mode runs against the user's OWN endpoint (the OpenAI slot pointed at a bridge
+/// instead of api.openai.com), upload glasses frames to `<base URL>/frames`. The bridge keeps them
+/// as a short visual memory and attaches the latest ones to every question, so the model behind it
+/// sees the current view and can look back in time. Nothing is uploaded to api.openai.com.
+///
+/// Upload economics: a frame goes out when the view changed since the last one sent, at most every
+/// `minInterval`, and at least every `heartbeat` so the bridge knows the camera is still on.
+@MainActor
+final class BridgeWatch {
+
+    static let shared = BridgeWatch()
+    private init() {}
+
+    private static let minInterval: TimeInterval = 0.7
+    private static let heartbeat: TimeInterval = 4.0
+    /// Lower than FrameChange.sceneChangeThreshold on purpose: the memory should also catch small
+    /// changes (a hand putting something down), not only head turns.
+    private static let changeThreshold = 0.03
+
+    private var task: Task<Void, Never>?
+    private var lastSentThumb: [UInt8]?
+    private var lastSentAt = Date.distantPast
+    private var lastSeenFrameTime = Date.distantPast
+    private(set) var framesSent = 0
+
+    var isRunning: Bool { task != nil }
+
+    nonisolated static func isCustomEndpoint(_ baseURL: String) -> Bool {
+        let lower = baseURL.lowercased()
+        return !lower.isEmpty && !lower.contains("api.openai.com")
+    }
+
+    /// True when the selected backend is the OpenAI slot with an API key and a custom base URL.
+    static var isAvailable: Bool {
+        let settings = SettingsManager.shared.settings
+        return settings.aiBackend == .openAI && settings.isOpenAIAPIAvailable
+            && isCustomEndpoint(settings.openAIBaseURL)
+    }
+
+    func start() {
+        stop()
+        framesSent = 0
+        task = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                let sent = await self.sendIfWorthIt()
+                try? await Task.sleep(nanoseconds: sent ? 250_000_000 : 350_000_000)
+            }
+        }
+    }
+
+    func stop() {
+        task?.cancel()
+        task = nil
+        lastSentThumb = nil
+        lastSentAt = .distantPast
+        lastSeenFrameTime = .distantPast
+    }
+
+    private func sendIfWorthIt() async -> Bool {
+        let glasses = GlassesManager.shared
+        let frameTime = glasses.lastFrameTime
+        // Only a frame we have not looked at yet, and only a fresh one: when the stream pauses
+        // (app in the background, Bluetooth throttling) nothing is sent.
+        guard let frame = glasses.lastFrame, frameTime > lastSeenFrameTime,
+              Date().timeIntervalSince(frameTime) < 1.0 else { return false }
+        lastSeenFrameTime = frameTime
+
+        let sinceLast = Date().timeIntervalSince(lastSentAt)
+        guard sinceLast >= Self.minInterval else { return false }
+        let thumb = Self.thumbnail(frame)
+        if let last = lastSentThumb, sinceLast < Self.heartbeat,
+           FrameChange.difference(thumb, last) < Self.changeThreshold {
+            return false
+        }
+        guard let jpeg = frame.jpegData(compressionQuality: 0.5) else { return false }
+
+        let settings = SettingsManager.shared.settings
+        guard let url = URL(string: "\(settings.openAIBaseURL)/frames") else { return false }
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("image/jpeg", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(settings.openAIAPIKey)", forHTTPHeaderField: "Authorization")
+        request.setValue(String(format: "%.3f", frameTime.timeIntervalSince1970), forHTTPHeaderField: "X-Frame-Time")
+        request.timeoutInterval = 10
+
+        lastSentThumb = thumb
+        lastSentAt = Date()
+        do {
+            let (_, response) = try await URLSession.shared.upload(for: request, from: jpeg)
+            if let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) {
+                framesSent += 1
+                if framesSent == 1 || framesSent % 100 == 0 {
+                    NSLog("[BridgeWatch] frames sent: %d", framesSent)
+                }
+                return true
+            }
+            NSLog("[BridgeWatch] frame refused: HTTP %d", (response as? HTTPURLResponse)?.statusCode ?? -1)
+        } catch {
+            NSLog("[BridgeWatch] frame upload failed: %@", error.localizedDescription)
+        }
+        // The bridge is unreachable or refusing: back off instead of hammering it.
+        try? await Task.sleep(nanoseconds: 2_000_000_000)
+        return false
+    }
+
+    /// 16x16 grayscale thumbnail for the change gate (same shape the live watch loop uses).
+    private static func thumbnail(_ image: UIImage) -> [UInt8] {
+        let side = 16
+        var pixels = [UInt8](repeating: 0, count: side * side)
+        guard let cg = image.cgImage else { return pixels }
+        let colorSpace = CGColorSpaceCreateDeviceGray()
+        pixels.withUnsafeMutableBytes { buffer in
+            guard let context = CGContext(
+                data: buffer.baseAddress, width: side, height: side,
+                bitsPerComponent: 8, bytesPerRow: side, space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return }
+            context.interpolationQuality = .low
+            context.draw(cg, in: CGRect(x: 0, y: 0, width: side, height: side))
+        }
+        return pixels
     }
 }
