@@ -3,6 +3,7 @@
 
 import Foundation
 import SwiftUI
+import AVFoundation
 import CoreMedia
 import OSLog
 import MWDATCore
@@ -28,6 +29,11 @@ final class GlassesManager: ObservableObject {
 
     /// Whether camera streaming is active
     @Published var isStreaming: Bool = false
+
+    /// Whether the running stream was opened with the glasses' microphone on it (camera audio
+    /// streaming). Decided once per stream, from Meta AI's microphone grant. Buffers arrive
+    /// through `GlassesAudioRelay`.
+    @Published private(set) var streamCarriesAudio: Bool = false
 
     /// Last captured video frame
     @Published var lastFrame: UIImage?
@@ -57,6 +63,7 @@ final class GlassesManager: ObservableObject {
     private var videoFrameListenerToken: (any AnyListenerToken)?
     private var photoDataListenerToken: (any AnyListenerToken)?
     private var errorListenerToken: (any AnyListenerToken)?
+    private var audioFrameListenerToken: (any AnyListenerToken)?
 
     // MARK: - Callbacks
 
@@ -123,8 +130,14 @@ final class GlassesManager: ObservableObject {
 
     // MARK: - Streaming
 
-    /// Start camera streaming from glasses
-    func startStreaming() async {
+    /// Start camera streaming from glasses.
+    ///
+    /// `withAudio` asks for the glasses' microphone on the same stream (experimental in the SDK).
+    /// It is the only way to hear the glasses while their camera runs: the Bluetooth HFP mic
+    /// goes deaf during streaming. The audio is requested only when Meta AI's microphone grant
+    /// is there, because a stream asked for audio the wearer never allowed may not start at all.
+    /// `frameRate` must be one of the SDK's values: 2, 7, 15, 24, 30.
+    func startStreaming(withAudio: Bool = false, frameRate: UInt = 30) async {
         guard isRegistered else {
             errorMessage = "Not registered with Meta AI"
             print("[GlassesManager] Cannot start streaming - not registered")
@@ -181,14 +194,44 @@ final class GlassesManager: ObservableObject {
             return
         }
 
+        // Glasses microphone on the stream: only with the grant (see the method comment).
+        var carriesAudio = false
+        if withAudio {
+            do {
+                var micStatus = try await wearables.checkPermissionStatus(.microphone)
+                print("[GlassesManager] Microphone permission status: \(micStatus)")
+                if micStatus != .granted {
+                    print("[GlassesManager] Requesting microphone permission...")
+                    micStatus = try await wearables.requestPermission(.microphone)
+                    print("[GlassesManager] After request, microphone status: \(micStatus)")
+                }
+                carriesAudio = micStatus == .granted
+            } catch {
+                print("[GlassesManager] Microphone permission unavailable: \(error)")
+            }
+            if !carriesAudio {
+                print("[GlassesManager] No microphone grant — the stream will carry video only")
+            }
+        }
+
         // SpecificDeviceSelector stays the more reliable choice over AutoDeviceSelector
         let specificSelector = SpecificDeviceSelector(device: deviceId)
 
-        let config = StreamConfiguration(
-            videoCodec: .raw,
-            resolution: .medium,
-            frameRate: 30
-        )
+        let config: StreamConfiguration
+        if carriesAudio {
+            config = StreamConfiguration(
+                videoCodec: .raw,
+                audioCodec: .pcm(sampleRate: .rate16000, numberOfChannels: 1),
+                resolution: .medium,
+                frameRate: frameRate
+            )
+        } else {
+            config = StreamConfiguration(
+                videoCodec: .raw,
+                resolution: .medium,
+                frameRate: frameRate
+            )
+        }
 
         do {
             let session = try wearables.createSession(deviceSelector: specificSelector)
@@ -245,10 +288,12 @@ final class GlassesManager: ObservableObject {
             }
             camera = cam
 
-            setupStreamListeners(stream: cam.stream)
+            // The audio listener must be registered before the stream starts.
+            setupStreamListeners(stream: cam.stream, withAudio: carriesAudio)
             cam.stream.start()
             isStreaming = true
-            print("[GlassesManager] Streaming started successfully")
+            streamCarriesAudio = carriesAudio
+            print("[GlassesManager] Streaming started successfully (\(frameRate) fps, audio: \(carriesAudio ? "on" : "off"))")
         } catch {
             errorMessage = "Stream start failed: \(error.localizedDescription)"
             print("[GlassesManager] Stream start error: \(error)")
@@ -264,6 +309,8 @@ final class GlassesManager: ObservableObject {
 
         print("[GlassesManager] Stopping camera stream")
 
+        // Cancel the audio listener before the camera stops (SDK guidance), then the rest.
+        audioFrameListenerToken = nil
         camera?.stop()          // cascades to the stream
         deviceSession?.stop()
 
@@ -271,6 +318,8 @@ final class GlassesManager: ObservableObject {
         camera = nil
         deviceSession = nil
         isStreaming = false
+        streamCarriesAudio = false
+        GlassesAudioRelay.shared.reset()
         lastFrame = nil
         lastFrameTime = .distantPast
 
@@ -324,7 +373,15 @@ final class GlassesManager: ObservableObject {
         }
     }
 
-    private func setupStreamListeners(stream: MWDATCamera.Stream) {
+    private func setupStreamListeners(stream: MWDATCamera.Stream, withAudio: Bool = false) {
+        // Glasses microphone. Delivered straight from the SDK's callback, in order, to the relay:
+        // hopping each buffer through its own main-actor Task would let them arrive out of order.
+        if withAudio {
+            audioFrameListenerToken = stream.audioFramePublisher.listen { frame in
+                GlassesAudioRelay.shared.deliver(frame.pcmBuffer)
+            }
+        }
+
         // State listener
         stateListenerToken = stream.statePublisher.listen { [weak self] state in
             Task { @MainActor in
@@ -404,5 +461,83 @@ final class GlassesManager: ObservableObject {
         videoFrameListenerToken = nil
         photoDataListenerToken = nil
         errorListenerToken = nil
+        audioFrameListenerToken = nil
+    }
+}
+
+// MARK: - Glasses microphone relay
+
+/// Hands the glasses' microphone buffers (camera audio streaming) to whoever is listening, on the
+/// SDK's own callback thread and in arrival order. Each buffer is converted into a fresh 16 kHz
+/// mono float buffer first: the SDK asks that its buffers are not mutated, and the consumers
+/// (speech recognition, voice-activity detection) get one known format whatever the glasses send.
+final class GlassesAudioRelay: @unchecked Sendable {
+
+    static let shared = GlassesAudioRelay()
+    private init() {}
+
+    private let lock = NSLock()
+    private var handler: ((AVAudioPCMBuffer) -> Void)?
+    private var lastFrame = Date.distantPast
+    private var converter: AVAudioConverter?
+    private let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000,
+                                             channels: 1, interleaved: false)
+
+    /// When the last buffer arrived. "Recent" means the glasses microphone is really flowing.
+    var lastFrameTime: Date {
+        lock.lock()
+        defer { lock.unlock() }
+        return lastFrame
+    }
+
+    func setHandler(_ newHandler: ((AVAudioPCMBuffer) -> Void)?) {
+        lock.lock()
+        handler = newHandler
+        lock.unlock()
+    }
+
+    func reset() {
+        lock.lock()
+        lastFrame = .distantPast
+        converter = nil
+        lock.unlock()
+    }
+
+    func deliver(_ buffer: AVAudioPCMBuffer) {
+        guard buffer.frameLength > 0, let targetFormat else { return }
+
+        lock.lock()
+        let firstBuffer = lastFrame == .distantPast
+        lastFrame = Date()
+        if converter == nil || converter?.inputFormat != buffer.format {
+            converter = AVAudioConverter(from: buffer.format, to: targetFormat)
+        }
+        let activeConverter = converter
+        let activeHandler = handler
+        lock.unlock()
+
+        if firstBuffer {
+            NSLog("[GlassesAudio] microphone flowing: %@, %d frames a buffer", "\(buffer.format)", Int(buffer.frameLength))
+        }
+        guard let activeConverter, let activeHandler else { return }
+
+        let ratio = targetFormat.sampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 16
+        guard let converted = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
+
+        // One buffer in, then "no data now": the converter pulls its input.
+        var supplied = false
+        var conversionError: NSError?
+        activeConverter.convert(to: converted, error: &conversionError) { _, status in
+            if supplied {
+                status.pointee = .noDataNow
+                return nil
+            }
+            supplied = true
+            status.pointee = .haveData
+            return buffer
+        }
+        guard conversionError == nil, converted.frameLength > 0 else { return }
+        activeHandler(converted)
     }
 }

@@ -100,6 +100,13 @@ final class VoiceCommandService: ObservableObject {
 
     private var audioEngine: AVAudioEngine?
 
+    /// Chooses which microphone feeds the live recognition request: the phone's engine tap, or an
+    /// external source (the glasses' microphone riding the camera stream). See `setExternalAudio`.
+    private let audioRouter = RecognitionAudioRouter()
+
+    /// True while recognition listens to the external microphone instead of the phone's.
+    var usesExternalAudio: Bool { audioRouter.isExternal }
+
     /// Throttle for the wake-word auto-restart. On some audio routes (notably the glasses'
     /// Bluetooth HFP mic) the recognizer finalizes immediately, and restarting with no delay
     /// spins a tight infinite loop that freezes the app. We coalesce restarts to at most one
@@ -219,6 +226,8 @@ final class VoiceCommandService: ObservableObject {
         }
 
         configureRecognitionRequest(recognitionRequest)
+        audioRouter.setRequest(recognitionRequest)
+        let router = audioRouter
 
         // Get input node
         let inputNode = audioEngine.inputNode
@@ -245,8 +254,10 @@ final class VoiceCommandService: ObservableObject {
         let detector = speechDetector
         if let reason = OVCatchException({
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
-                recognitionRequest.append(buffer)
-                detector.feed(buffer)
+                // Dropped while an external microphone is selected.
+                if router.append(buffer, fromExternal: false) {
+                    detector.feed(buffer)
+                }
             }
         }) {
             print("[VoiceCommand] installTap failed: \(reason)")
@@ -334,12 +345,38 @@ final class VoiceCommandService: ObservableObject {
         }
     }
 
+    // MARK: - External microphone (glasses audio on the camera stream)
+
+    /// A sink for buffers from an external microphone. Safe to call from any one thread, in
+    /// order; buffers are ignored unless `setExternalAudio(true)` is in effect.
+    func makeExternalAudioSink() -> (AVAudioPCMBuffer) -> Void {
+        let router = audioRouter
+        let detector = speechDetector
+        return { buffer in
+            if router.append(buffer, fromExternal: true) {
+                detector.feed(buffer)
+            }
+        }
+    }
+
+    /// Switch recognition between the phone's microphone and the external one. The phone's audio
+    /// engine keeps running either way (it is the fallback, and what keeps the session alive);
+    /// only the source of the recognizer's audio changes. Recognition restarts on a fresh request
+    /// because the two microphones deliver different formats.
+    func setExternalAudio(_ enabled: Bool) {
+        guard audioRouter.isExternal != enabled else { return }
+        audioRouter.setExternal(enabled)
+        print("[VoiceCommand] Microphone source: \(enabled ? "external (glasses stream)" : "phone")")
+        restartRecognition()
+    }
+
     /// Stop listening
     func stopListening() {
         recognitionGeneration += 1   // orphan any in-flight callbacks from the dying task
         recognitionTask?.cancel()
         recognitionTask = nil
 
+        audioRouter.setRequest(nil)   // no source may append to a request that is being ended
         recognitionRequest?.endAudio()
         recognitionRequest = nil
 
@@ -390,6 +427,7 @@ final class VoiceCommandService: ObservableObject {
         recognitionGeneration += 1
         recognitionTask?.cancel()
         recognitionTask = nil
+        audioRouter.setRequest(nil)   // no source may append to a request that is being ended
         recognitionRequest?.endAudio()
         recognitionRequest = nil
 
@@ -401,6 +439,8 @@ final class VoiceCommandService: ObservableObject {
         guard let recognitionRequest = recognitionRequest else { return }
 
         configureRecognitionRequest(recognitionRequest)
+        audioRouter.setRequest(recognitionRequest)
+        let router = audioRouter
 
         // Reinstall tap
         guard let audioEngine = audioEngine else { return }
@@ -437,8 +477,10 @@ final class VoiceCommandService: ObservableObject {
         let detector = speechDetector
         if let reason = OVCatchException({
             inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { buffer, _ in
-                recognitionRequest.append(buffer)
-                detector.feed(buffer)
+                // Dropped while an external microphone is selected.
+                if router.append(buffer, fromExternal: false) {
+                    detector.feed(buffer)
+                }
             }
         }) {
             print("[VoiceCommand] installTap (reinstall) failed: \(reason)")
@@ -881,5 +923,46 @@ enum VoiceCommandError: LocalizedError {
         case .audioEngineUnavailable: return "Audio engine unavailable"
         case .requestCreationFailed: return "Failed to create speech recognition request"
         }
+    }
+}
+
+// MARK: - Recognition audio routing
+
+/// Appends microphone buffers to the live recognition request from exactly one source at a time.
+/// The phone's engine tap and the external (glasses) feed both call `append`; only the selected
+/// one gets through. The append happens under the lock, so swapping or clearing the request can
+/// never race a buffer into a request that has already been ended.
+final class RecognitionAudioRouter: @unchecked Sendable {
+
+    private let lock = NSLock()
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var external = false
+
+    var isExternal: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return external
+    }
+
+    func setExternal(_ enabled: Bool) {
+        lock.lock()
+        external = enabled
+        lock.unlock()
+    }
+
+    func setRequest(_ newRequest: SFSpeechAudioBufferRecognitionRequest?) {
+        lock.lock()
+        request = newRequest
+        lock.unlock()
+    }
+
+    /// Returns true when the buffer was appended (its source is the selected one).
+    @discardableResult
+    func append(_ buffer: AVAudioPCMBuffer, fromExternal: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard external == fromExternal, let request else { return false }
+        request.append(buffer)
+        return true
     }
 }

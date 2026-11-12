@@ -114,7 +114,11 @@ packages:
     # camera-consolidation API: DeviceSession.addCamera(config:) -> Camera -> camera.stream
     # (StreamSession/addStream are gone). Requires iOS 17.2+.
     # MUST be regression-tested on Gen 1/2 glasses (register + stream + HFP mic) before merge.
-    exactVersion: "0.9.0"
+    #
+    # 0.9.0 -> 1.0.1 (Ray's fork): 1.0.0 adds camera audio streaming (StreamConfiguration.audioCodec,
+    # Stream.audioFramePublisher), which carries the glasses microphone on the camera stream. That is
+    # what lets the glasses mic and camera run together; the Bluetooth HFP mic cannot.
+    exactVersion: "1.0.1"
   # PrismML fork of mlx-swift, adding 1-bit quantized Metal kernels (upstream PR pending).
   # Needed to load Bonsai-8B (Qwen3-8B at 1-bit g128, 1.28 GB vs E2B's 3.6 GB). Declared at the
   # ROOT so every consumer (mlx-swift-lm + the three vendored packages) resolves the same identity.

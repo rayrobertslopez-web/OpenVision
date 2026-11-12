@@ -83,6 +83,9 @@ final class VoiceAgentViewModel: ObservableObject {
     /// Live video mode is running against the user's own bridge (BridgeWatch): frames are uploaded
     /// continuously, speech stays on Apple STT and questions go over chat completions.
     private var bridgeWatchActive = false
+    /// Bridge watch mode: switches speech recognition to the glasses' microphone while its audio
+    /// is really arriving on the camera stream, and back to the phone's when it is not.
+    private var glassesMicTask: Task<Void, Never>?
 
     // MARK: - Agent State
 
@@ -1193,8 +1196,14 @@ final class VoiceAgentViewModel: ObservableObject {
     private func startBridgeLiveVideoMode() async {
         print("[VoiceAgent] Starting bridge watch mode...")
 
+        // Open the stream with the glasses' microphone on it, at a low frame rate: watching
+        // needs about one frame a second, and a lighter video load leaves the Bluetooth link
+        // room for the audio. A stream already running without audio is reopened.
+        if glassesManager.isStreaming && !glassesManager.streamCarriesAudio {
+            await glassesManager.stopStreaming()
+        }
         if !glassesManager.isStreaming {
-            await glassesManager.startStreaming()
+            await glassesManager.startStreaming(withAudio: true, frameRate: 7)
         }
         guard glassesManager.isStreaming else {
             ttsService.speak("I couldn't start the glasses camera")
@@ -1218,6 +1227,7 @@ final class VoiceAgentViewModel: ObservableObject {
         // The camera stream pauses when the phone locks, so keep the screen awake while watching.
         UIApplication.shared.isIdleTimerDisabled = true
         BridgeWatch.shared.start()
+        startGlassesMicMonitor()
 
         print("[VoiceAgent] ✓ Bridge watch mode active - uploading frames, questions over chat completions")
         if settingsManager.settings.wakeWordEnabled {
@@ -1225,6 +1235,33 @@ final class VoiceAgentViewModel: ObservableObject {
         } else {
             ttsService.speak("Watching. Ask me anything.")
         }
+    }
+
+    /// The phone's microphone carries bridge watch mode until the glasses' own microphone is
+    /// heard on the camera stream; then recognition listens to the glasses instead (the phone can
+    /// stay in a pocket). If that audio stops for a few seconds, the phone's microphone takes
+    /// over again. Driven by what actually arrives, so a stream opened without the microphone
+    /// grant simply never switches.
+    private func startGlassesMicMonitor() {
+        glassesMicTask?.cancel()
+        GlassesAudioRelay.shared.setHandler(voiceCommandService.makeExternalAudioSink())
+        glassesMicTask = Task { [weak self] in
+            while let self, !Task.isCancelled, self.bridgeWatchActive {
+                let flowing = Date().timeIntervalSince(GlassesAudioRelay.shared.lastFrameTime) < 2.5
+                if flowing != self.voiceCommandService.usesExternalAudio {
+                    NSLog("[OV] watch: microphone -> %@", flowing ? "glasses (camera stream)" : "phone")
+                    self.voiceCommandService.setExternalAudio(flowing)
+                }
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+            }
+        }
+    }
+
+    private func stopGlassesMicMonitor() {
+        glassesMicTask?.cancel()
+        glassesMicTask = nil
+        GlassesAudioRelay.shared.setHandler(nil)
+        voiceCommandService.setExternalAudio(false)
     }
 
     /// Answer a spoken question in bridge watch mode. The bridge already holds the recent frames;
@@ -1648,6 +1685,7 @@ final class VoiceAgentViewModel: ObservableObject {
         stopWatchLoop()
         if bridgeWatchActive {
             BridgeWatch.shared.stop()
+            stopGlassesMicMonitor()
             bridgeWatchActive = false
             UIApplication.shared.isIdleTimerDisabled = false
         }
