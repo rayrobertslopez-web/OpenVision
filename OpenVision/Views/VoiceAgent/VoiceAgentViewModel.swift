@@ -1061,7 +1061,9 @@ final class VoiceAgentViewModel: ObservableObject {
         }
 
         guard glassesManager.isRegistered else {
-            ttsService.speak("Please connect your glasses first")
+            // "Connect your glasses" sent people to Bluetooth settings, where the glasses already
+            // show as paired. What is missing is this app's own link through the Meta AI app.
+            speakResponse("This app isn't linked to your glasses yet. Open Settings, then Glasses, and tap Register App.")
             return
         }
 
@@ -1197,7 +1199,14 @@ final class VoiceAgentViewModel: ObservableObject {
             await glassesManager.startStreaming()
         }
         guard glassesManager.isStreaming else {
-            ttsService.speak("I couldn't start the glasses camera")
+            if glassesManager.connectedDevice == nil {
+                speakResponse("I can't find your glasses. Make sure they're on, unfolded and connected to the phone.")
+            } else {
+                // Say the SDK's own reason: it is the only diagnosis the wearer can pass on.
+                let reason = glassesManager.errorMessage ?? "Check the Glasses page in Settings."
+                errorMessage = "Glasses camera did not start. \(reason)"
+                speakResponse("I couldn't start the glasses camera. \(reason)")
+            }
             return
         }
 
