@@ -140,6 +140,33 @@
         <true/>
         <key>NSAllowsLocalNetworking</key>
         <true/>
+        <!-- iOS 17+: plain-HTTP connections to IP addresses need explicit CIDR exceptions
+             (the Claude bridge is http://100.81.22.76:8095 on Tailscale, http://192.168.x.x on Wi-Fi) -->
+        <key>NSExceptionDomains</key>
+        <dict>
+            <key>100.64.0.0/10</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+            </dict>
+            <key>192.168.0.0/16</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+            </dict>
+            <key>10.0.0.0/8</key>
+            <dict>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+            </dict>
+            <key>ts.net</key>
+            <dict>
+                <key>NSIncludesSubdomains</key>
+                <true/>
+                <key>NSExceptionAllowsInsecureHTTPLoads</key>
+                <true/>
+            </dict>
+        </dict>
     </dict>
 
     <!-- Export compliance: the app only uses standard HTTPS, so TestFlight needs no per-build encryption answer -->
